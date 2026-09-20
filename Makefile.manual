@@ -1,0 +1,55 @@
+# Manual build — no meson. The four raw steps meson hides:
+#
+#   1. bpftool dumps the running kernel's types  -> vmlinux.h
+#   2. clang compiles the BPF side               -> scx_foo.bpf.o   (clang only!)
+#   3. bpftool wraps the object in a skeleton    -> scx_foo.bpf.skel.h
+#   4. gcc OR clang builds the userspace loader  -> scx_foo
+#
+# Requirements:
+#   - clang >= 16 (BPF object; gcc's BPF backend is not sufficient here)
+#   - bpftool     (Arch: bpftool | openSUSE: bpftool | Ubuntu: linux-tools-common + linux-tools-$(uname -r))
+#   - libbpf headers + lib (libbpf/libbpf-devel/libbpf-dev), libelf, zlib
+#   - a checkout of https://github.com/sched-ext/scx for the compat headers
+#     (scx/common.bpf.h, scx/common.h) — set SCX below or on the command line.
+#
+# Usage:
+#   make -f Makefile.manual SCX=~/src/scx            # build all three
+#   make -f Makefile.manual SCX=~/src/scx scx_minfifo
+#   sudo ./scx_minfifo
+#
+# Loader compiler is $(CC): CC=gcc (default) or CC=clang both work.
+
+SCX     ?= $(HOME)/scx
+SCHEDS  := scx_minfifo scx_toydsq scx_prefcore
+
+# x86_64 -> x86, aarch64 -> arm64 for the BPF target define
+ARCH    := $(shell uname -m | sed 's/x86_64/x86/;s/aarch64/arm64/')
+
+BPF_CFLAGS  := -O2 -g -target bpf -D__TARGET_ARCH_$(ARCH) -mcpu=v3 \
+               -I. -I$(SCX)/scheds/include
+USER_CFLAGS := -O2 -g -I. -I$(SCX)/scheds/include
+LDLIBS      := -lbpf -lelf -lz
+
+.PHONY: all clean
+all: $(SCHEDS)
+
+# 1. Types of the *running* kernel, as a C header. CO-RE relocations make
+#    the resulting object portable to other kernels at load time.
+vmlinux.h:
+	bpftool btf dump file /sys/kernel/btf/vmlinux format c > $@
+
+# 2. BPF object. -g is required (BTF), -mcpu=v3 for modern BPF instructions.
+%.bpf.o: %.bpf.c vmlinux.h
+	clang $(BPF_CFLAGS) -c $< -o $@
+
+# 3. Skeleton: the bytecode embedded in a header, plus typed accessors for
+#    maps and rodata ("name" must match what the loaders include/use).
+%.bpf.skel.h: %.bpf.o
+	bpftool gen skeleton $< name $* > $@
+
+# 4. Loader: plain userspace C — gcc or clang, your choice.
+$(SCHEDS): %: %.c %.bpf.skel.h
+	$(CC) $(USER_CFLAGS) $< -o $@ $(LDLIBS)
+
+clean:
+	rm -f $(SCHEDS) *.bpf.o *.bpf.skel.h vmlinux.h
