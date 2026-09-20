@@ -49,14 +49,16 @@ void BPF_STRUCT_OPS(minfifo_enqueue, struct task_struct *p, u64 enq_flags)
 }
 
 /*
- * ops.dequeue - the mirror image. The core calls this when it needs the
- * task back *before* we dispatched it: the task is being migrated, its
- * affinity or priority changed, or it stopped being runnable.
+ * ops.dequeue - the mirror image. Called when a task leaves the BPF
+ * scheduler's *custody* - and a task only enters custody when it sits in
+ * a custom DSQ or in the scheduler's own data structures (BPF maps,
+ * rbtrees...). Kernel 7.x formalized these semantics: tasks sent to the
+ * "terminal" DSQs (LOCAL, LOCAL_ON, GLOBAL) never enter custody at all.
  *
- * Tasks sitting in DSQs are removed automatically; dequeue exists so a
- * scheduler that keeps tasks in its *own* data structures (BPF maps,
- * rbtrees...) can drop its bookkeeping. We have no bookkeeping, so this
- * is a no-op - included only so the three verbs are all on one slide.
+ * This scheduler only ever touches SCX_DSQ_GLOBAL, so dequeue never
+ * fires here - it is a no-op included so all three verbs are on one
+ * slide. Stages 2 and 3 use custom DSQs, where the kernel does invoke
+ * dequeue on property changes (affinity, nice, migration).
  */
 void BPF_STRUCT_OPS(minfifo_dequeue, struct task_struct *p, u64 deq_flags)
 {

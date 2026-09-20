@@ -68,19 +68,25 @@ struct {
 	__type(value, struct task_ctx);
 } task_ctx_stor SEC(".maps");
 
-enum stat_idx {
+/*
+ * Prefixed to avoid colliding with kernel enumerators pulled in through
+ * vmlinux.h - the kernel already defines a NR_STATS (vmstat), and every
+ * name in that 100k-line header shares our namespace. A real-world BPF
+ * lesson: prefix your identifiers.
+ */
+enum prefcore_stat_idx {
 	STAT_DIRECT,	/* wakeup found an idle CPU, skipped the queues */
 	STAT_LAT_ENQ,	/* enqueued on DSQ_LATENCY */
 	STAT_BATCH_ENQ,	/* enqueued on DSQ_BATCH */
 	STAT_XTIER,	/* a tier had to service the other tier's queue */
-	NR_STATS,
+	PREFCORE_NR_STATS,
 };
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(key_size, sizeof(u32));
 	__uint(value_size, sizeof(u64));
-	__uint(max_entries, NR_STATS);
+	__uint(max_entries, PREFCORE_NR_STATS);
 } stats SEC(".maps");
 
 /* Last observed cpuperf level per CPU (0..SCX_CPUPERF_ONE), for demo. */
@@ -174,20 +180,23 @@ void BPF_STRUCT_OPS(prefcore_enqueue, struct task_struct *p, u64 enq_flags)
  * latency queue; weak cores prefer the batch queue. Each falls back to
  * the other so work conservation holds: an idle strong core will happily
  * chew batch work rather than sit idle, and vice versa.
+ *
+ * Second argument is enq_flags for the move; 0 = default behaviour.
+ * (Older scx spells this with one argument - see the README.)
  */
 void BPF_STRUCT_OPS(prefcore_dispatch, s32 cpu, struct task_struct *prev)
 {
 	bool strong = cpu >= 0 && cpu < MAX_CPUS && strong_cpu[cpu];
 
 	if (strong) {
-		if (scx_bpf_dsq_move_to_local(DSQ_LATENCY))
+		if (scx_bpf_dsq_move_to_local(DSQ_LATENCY, 0))
 			return;
-		if (scx_bpf_dsq_move_to_local(DSQ_BATCH))
+		if (scx_bpf_dsq_move_to_local(DSQ_BATCH, 0))
 			stat_inc(STAT_XTIER);
 	} else {
-		if (scx_bpf_dsq_move_to_local(DSQ_BATCH))
+		if (scx_bpf_dsq_move_to_local(DSQ_BATCH, 0))
 			return;
-		if (scx_bpf_dsq_move_to_local(DSQ_LATENCY))
+		if (scx_bpf_dsq_move_to_local(DSQ_LATENCY, 0))
 			stat_inc(STAT_XTIER);
 	}
 }

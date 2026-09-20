@@ -10,8 +10,8 @@ Three schedulers, one per act of the talk. Each stage introduces exactly one or 
 
 ## Requirements
 
-- Kernel ≥ 6.12 with `CONFIG_SCHED_CLASS_EXT=y` — see the per-distro notes below.
-- Stage 2 uses `scx_bpf_dsq_insert_vtime`; the 6.13+ kfunc names are used throughout (`scx_bpf_dsq_insert`, `scx_bpf_dsq_move_to_local`). The scx repo compat headers paper over older kernels.
+- Kernel ≥ 6.12 with `CONFIG_SCHED_CLASS_EXT=y` — see the per-distro notes below. **7.0+ recommended**: that is where the `scx_bpf_*` kfunc surface stabilized (plus EEVDF-interaction fixes), and the kfunc names and signatures used in this code match the 7.x documented API exactly.
+- Stage 2 uses `scx_bpf_dsq_insert_vtime`; current kfunc spellings are used throughout (`scx_bpf_dsq_insert`, `scx_bpf_dsq_move_to_local(dsq_id, enq_flags)`). The scx repo compat headers paper over older kernels.
 - clang ≥ 16, meson, libbpf ≥ 1.4 (scx's meson setup fetches and builds its own libbpf/bpftool if the system one is missing or too old, depending on scx version — network required in that case).
 - For the full stage-3 story: an AMD machine exposing `/sys/devices/system/cpu/cpu*/cpufreq/amd_pstate_prefcore_ranking` (amd-pstate in active/guided mode with preferred-core support). The loader falls back to `acpi_cppc/highest_perf`, then `cpuinfo_max_freq`, then uniform ranks — so it loads anywhere, it is just less interesting.
 
@@ -61,7 +61,7 @@ sudo reboot
 grep CONFIG_SCHED_CLASS_EXT /boot/config-$(uname -r)   # must print =y
 ```
 
-If your HWE kernel does not set the flag, options are a newer Ubuntu release (24.10+ kernels have it enabled) or a mainline/custom kernel with `CONFIG_SCHED_CLASS_EXT=y`. Then:
+If your HWE kernel does not set the flag, options are a newer Ubuntu release (24.10+ kernels have it enabled; releases shipping 7.x kernels are the best fit — see Requirements) or a mainline/custom kernel with `CONFIG_SCHED_CLASS_EXT=y`. On any Ubuntu kernel, 7.x included, keep the config check — it is the ground truth. Then:
 
 ```sh
 sudo apt install build-essential git meson clang llvm pkg-config \
@@ -129,6 +129,57 @@ gcc -O2 -I. -I ~/src/scx/scheds/include scx_minfifo.c -o scx_minfifo -lbpf -lelf
 ```
 
 This is also excellent talk material: it demystifies what "the build system" does — one type dump, one clang invocation, one code generator, one ordinary link.
+
+#### Troubleshooting the manual build
+
+**`fatal error: 'scx/common.bpf.h' file not found`** — `SCX` is pointing at the wrong place. It must be the path to an **scx checkout**, not to this demo directory:
+
+```sh
+make -f Makefile.manual SCX=.              # wrong: there is no ./scheds/include here
+git clone https://github.com/sched-ext/scx.git ~/src/scx
+make -f Makefile.manual SCX=~/src/scx      # right
+```
+
+Nothing is compiled from the checkout — only `scheds/include/scx/*.h` is borrowed. The Makefile now checks for `$(SCX)/scheds/include/scx/common.bpf.h` up front and prints this hint instead of a clang error. If a future scx release relocates the headers, point at them directly: `make -f Makefile.manual SCX_INC=/path/to/include`.
+
+**`struct ... __sched_ext_ops` has no member named `rescue_bandwidth_ppt`** (or `rescue_quantum_us`, or any other field, inside `SCX_OPS_OPEN`) — **you compiled against a `vmlinux.h` generated from your running kernel instead of the one bundled in the scx repo.** The BPF side compiling cleanly while only the loader fails is the signature.
+
+Why it happens: `scx/compat.h` is written against recent kernel types. It references newer `sched_ext_ops` fields at *compile* time and zeroes them at *runtime* when the live kernel lacks them — that is the whole point of the compat layer. So the correct input is scx's own newer `vmlinux.h`; CO-RE relocations make the result load fine on your older kernel.
+
+The Makefile now auto-detects scx's bundled header. Confirm what it resolved to:
+
+```sh
+make -f Makefile.manual SCX=../scx info
+#   SCX_VMLINUX = ../scx/scheds/include/arch/x86/vmlinux.h    <- good
+#   SCX_VMLINUX = <none found ...>                            <- see below
+make -f Makefile.manual clean && make -f Makefile.manual SCX=../scx
+```
+
+If auto-detection finds nothing, locate the header and point at it explicitly:
+
+```sh
+find ../scx -name 'vmlinux*.h' | head
+make -f Makefile.manual SCX=../scx SCX_VMLINUX=../scx/path/to/vmlinux.h
+```
+
+Pinning scx to an older revision also resolves it, and is the right move if you want the checkout to match your kernel exactly:
+
+```sh
+cd ../scx && git log --oneline -S rescue_bandwidth_ppt -- scheds/include/scx/compat.h | tail -1
+git checkout <that_commit>^
+```
+
+**`redefinition of enumerator 'NR_STATS'` (or any identifier, pointing at vmlinux.h)** — your name collides with a kernel identifier. vmlinux.h is the *entire kernel's* type universe dumped into one header, and BPF C shares one namespace with it, so short generic names (`NR_STATS`, `MAX_ENTRIES`, `STAT_READ`...) are land mines. Prefix your enums and structs — this repo uses `PREFCORE_NR_STATS` for exactly this reason. Worth ten seconds in the talk: it surprises everyone once.
+
+**`declaration does not declare anything [-Wmissing-declarations]` (×9 or so, from vmlinux.h)** — harmless. bpftool's type dump emits forward declarations for anonymous types. The Makefile passes `-Wno-missing-declarations` to keep the build output quiet on stage.
+
+**`skipping /sys/kernel/btf/vmlinux (will be loaded as base)` on stderr** — harmless bpftool chatter, not an error; the dump still runs. Sanity check with `wc -l vmlinux.h` (expect tens of thousands of lines).
+
+**`bpftool: command not found`** — Arch: `pacman -S bpf`; openSUSE: `zypper in bpftool`; Ubuntu: `apt install linux-tools-common linux-tools-$(uname -r)`.
+
+**`fatal error: 'bpf/bpf_helpers.h' file not found`** — libbpf headers missing: `libbpf` (Arch) / `libbpf-devel` (openSUSE) / `libbpf-dev` (Ubuntu).
+
+**`cannot find -lbpf` at link time** — the loader links against system libbpf; on Ubuntu 24.04 the packaged libbpf is 1.3, which is usually fine for these loaders. If it is not, build libbpf from source or fall back to the meson path, which can vendor its own.
 
 **Before the talk, diff against the current `scheds/c/scx_simple.c`/`.bpf.c` in your checkout.** The sched_ext API still moves; the compat macros (`SCX_OPS_OPEN/LOAD/ATTACH`, `UEI_*`) and kfunc names in these files match early-2026 scx, but the repo is the source of truth. See "API checkpoints" below.
 
@@ -207,7 +258,20 @@ Three layers of observability, from "is it in charge" to "what does it cost":
 ```sh
 watch -n1 'cat /sys/kernel/sched_ext/state /sys/kernel/sched_ext/root/ops'
 # state: enabled | disabled     ops: minfifo / toydsq / prefcore
+cat /sys/kernel/sched_ext/enable_seq   # how many BPF schedulers loaded since boot
 ```
+
+**Kernel-side event counters (7.x kernels).** The kernel itself keeps per-scheduler diagnostic counters — no code on your side needed:
+
+```sh
+cat /sys/kernel/sched_ext/root/events
+# SCX_EV_SELECT_CPU_FALLBACK: your select_cpu returned a CPU the task can't use
+# SCX_EV_DISPATCH_KEEP_LAST:  CPU kept running the same task (nothing else queued)
+# SCX_EV_REFILL_SLICE_DFL:    slices refilled with the default value
+# SCX_EV_BYPASS_*:            time spent in bypass (load/unload/error recovery)
+```
+
+`SCX_EV_SELECT_CPU_FALLBACK` climbing under scx_prefcore would mean the ranked scan is returning disallowed CPUs — a free correctness check on the demo box. `tools/sched_ext/scx_show_state.py` in the kernel tree (a drgn script) shows even more.
 
 **Your own counters (the loaders' stdout).** This is the maps channel doing its job:
 
@@ -271,10 +335,23 @@ The `D` dump is also what you get automatically when the watchdog kills a misbeh
 
 ## API checkpoints (verify at build time)
 
-Names most likely to have drifted; all are used here with their 6.13+/scx-2026 spellings:
+**Check arity before you build** — names drift, but so do argument lists. One command tells you what your checkout expects:
+
+```sh
+grep -n -E 'define (scx_bpf_dsq_insert|scx_bpf_dsq_insert_vtime|scx_bpf_dsq_move_to_local|scx_bpf_select_cpu_dfl)' \
+     ../scx/scheds/include/scx/*.bpf.h
+# ...and the canonical usage, which is always the ground truth:
+grep -n 'scx_bpf_dsq_' ../scx/scheds/c/scx_simple.bpf.c
+```
+
+Known moving target: **`scx_bpf_dsq_move_to_local`** takes `(dsq_id, enq_flags)` in current scx; older revisions take `(dsq_id)` only, and older still call it `scx_bpf_consume(dsq_id)`. The code here uses the two-argument form with `enq_flags = 0`. If your checkout errors with *"too many arguments provided"*, drop the `, 0` in `scx_toydsq.bpf.c` and `scx_prefcore.bpf.c`.
+
+Names most likely to have drifted; all are used here with their current (kernel 7.x-documented) spellings:
 
 - `scx_bpf_dsq_insert`, `scx_bpf_dsq_insert_vtime` (formerly `scx_bpf_dispatch*`)
-- `scx_bpf_dsq_move_to_local` (formerly `scx_bpf_consume`)
+- `scx_bpf_dsq_move_to_local` (formerly `scx_bpf_consume`; gained an `enq_flags` argument)
+
+Semantics worth knowing on 7.x kernels: `ops.dequeue` follows formal "custody" rules — it fires only when a task leaves a *custom* DSQ or the scheduler's own data structures. Tasks sent to terminal DSQs (`LOCAL`, `LOCAL_ON`, `GLOBAL`) never enter custody, so scx_minfifo's dequeue never runs, while toydsq/prefcore (custom DSQs) do get dequeue calls on affinity/priority changes. The kernel's ABI-instability warning still stands regardless of version; the 7.0 stabilization is a practice, not a promise.
 - `scx_bpf_select_cpu_dfl`, `scx_bpf_test_and_clear_cpu_idle`, `scx_bpf_create_dsq`
 - `scx_bpf_cpuperf_cur`, `scx_bpf_cpuperf_cap`, `SCX_CPUPERF_ONE`
 - Macros from scx compat headers: `SCX_OPS_DEFINE`, `SCX_OPS_OPEN`, `SCX_OPS_LOAD`, `SCX_OPS_ATTACH`, `UEI_DEFINE/RECORD/REPORT/EXITED`, `BPF_STRUCT_OPS(_SLEEPABLE)`

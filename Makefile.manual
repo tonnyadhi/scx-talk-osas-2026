@@ -12,7 +12,13 @@
 #   - a checkout of https://github.com/sched-ext/scx for the compat headers
 #     (scx/common.bpf.h, scx/common.h) — set SCX below or on the command line.
 #
+# SCX must be the path to that CHECKOUT, not to this directory:
+#   SCX=.          -> wrong, there is no ./scheds/include here
+#   SCX=~/src/scx  -> right
+# Nothing is compiled from the checkout; we only borrow its headers.
+#
 # Usage:
+#   git clone https://github.com/sched-ext/scx.git ~/src/scx
 #   make -f Makefile.manual SCX=~/src/scx            # build all three
 #   make -f Makefile.manual SCX=~/src/scx scx_minfifo
 #   sudo ./scx_minfifo
@@ -25,21 +31,83 @@ SCHEDS  := scx_minfifo scx_toydsq scx_prefcore
 # x86_64 -> x86, aarch64 -> arm64 for the BPF target define
 ARCH    := $(shell uname -m | sed 's/x86_64/x86/;s/aarch64/arm64/')
 
+# Where the scx compat headers live inside the checkout. Override SCX_INC
+# directly if a future scx release moves them.
+SCX_INC ?= $(SCX)/scheds/include
+
+# --- which vmlinux.h do we compile against? -------------------------------
+# IMPORTANT: prefer the one BUNDLED IN THE SCX REPO, not one generated from
+# the running kernel. scx/compat.h is written against recent kernel types
+# (it references fields like rescue_bandwidth_ppt, then zeroes them at
+# runtime when the live kernel lacks them). Compiling against an older,
+# locally generated vmlinux.h makes compat.h fail with
+#   "struct ...__sched_ext_ops has no member named rescue_bandwidth_ppt".
+# CO-RE relocations + those runtime checks handle the real kernel at load
+# time, so compiling against newer types is correct and portable.
+#
+# Override explicitly if auto-detection misses:  make ... SCX_VMLINUX=/path/vmlinux.h
+SCX_VMLINUX ?= $(firstword $(wildcard \
+                 $(SCX_INC)/arch/$(ARCH)/vmlinux.h \
+                 $(SCX_INC)/vmlinux/vmlinux.h \
+                 $(SCX_INC)/vmlinux.h))
+
+ifneq ($(SCX_VMLINUX),)
+  # scx ships one: put its directory first on the include path.
+  VMLINUX_INC := -I$(dir $(SCX_VMLINUX))
+  VMLINUX_DEP :=
+else
+  # Fallback: generate from the running kernel (fine for older scx versions).
+  VMLINUX_INC :=
+  VMLINUX_DEP := vmlinux.h
+endif
+
+# Extra dirs some scx versions want; clang ignores the ones that don't exist.
+# -Wno-missing-declarations silences the harmless "declaration does not
+# declare anything" noise from bpftool's vmlinux.h dump (anonymous types).
 BPF_CFLAGS  := -O2 -g -target bpf -D__TARGET_ARCH_$(ARCH) -mcpu=v3 \
-               -I. -I$(SCX)/scheds/include
-USER_CFLAGS := -O2 -g -I. -I$(SCX)/scheds/include
+               -Wno-missing-declarations -Wno-compare-distinct-pointer-types \
+               $(VMLINUX_INC) -I. -I$(SCX_INC) -I$(SCX_INC)/bpf-compat \
+               -I$(SCX_INC)/arch/$(ARCH)
+USER_CFLAGS := -O2 -g -I. -I$(SCX_INC)
 LDLIBS      := -lbpf -lelf -lz
 
-.PHONY: all clean
+.PHONY: all clean check-scx info
 all: $(SCHEDS)
 
-# 1. Types of the *running* kernel, as a C header. CO-RE relocations make
-#    the resulting object portable to other kernels at load time.
+# Show what the build resolved to — first thing to check when it misbehaves.
+info:
+	@echo "SCX         = $(SCX)"
+	@echo "SCX_INC     = $(SCX_INC)"
+	@echo "ARCH        = $(ARCH)"
+	@echo "SCX_VMLINUX = $(if $(SCX_VMLINUX),$(SCX_VMLINUX),<none found - generating from running kernel>)"
+	@echo "CC          = $(CC)"
+
+# Fail early and loudly if SCX does not point at an scx *checkout*.
+# Order-only prerequisite (| check-scx): runs the check without forcing
+# a rebuild of the targets themselves.
+check-scx:
+	@test -f "$(SCX_INC)/scx/common.bpf.h" || { \
+	  echo ""; \
+	  echo "ERROR: scx headers not found at $(SCX_INC)/scx/common.bpf.h"; \
+	  echo ""; \
+	  echo "SCX must point at a sched-ext/scx CHECKOUT, not at this directory."; \
+	  echo "These headers are all we borrow from it - nothing is built there."; \
+	  echo ""; \
+	  echo "    git clone https://github.com/sched-ext/scx.git ~/src/scx"; \
+	  echo "    make -f Makefile.manual SCX=~/src/scx"; \
+	  echo ""; \
+	  exit 1; }
+
+# 1. Kernel types as a C header. Only built when scx ships no vmlinux.h of
+#    its own (see SCX_VMLINUX above). CO-RE relocations make the resulting
+#    object portable across kernels at load time.
+#    ("skipping ... will be loaded as base" on stderr is normal; sanity
+#     check the result with: wc -l vmlinux.h  -> tens of thousands of lines)
 vmlinux.h:
 	bpftool btf dump file /sys/kernel/btf/vmlinux format c > $@
 
 # 2. BPF object. -g is required (BTF), -mcpu=v3 for modern BPF instructions.
-%.bpf.o: %.bpf.c vmlinux.h
+%.bpf.o: %.bpf.c $(VMLINUX_DEP) | check-scx
 	clang $(BPF_CFLAGS) -c $< -o $@
 
 # 3. Skeleton: the bytecode embedded in a header, plus typed accessors for
@@ -48,7 +116,7 @@ vmlinux.h:
 	bpftool gen skeleton $< name $* > $@
 
 # 4. Loader: plain userspace C — gcc or clang, your choice.
-$(SCHEDS): %: %.c %.bpf.skel.h
+$(SCHEDS): %: %.c %.bpf.skel.h | check-scx
 	$(CC) $(USER_CFLAGS) $< -o $@ $(LDLIBS)
 
 clean:
