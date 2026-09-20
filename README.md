@@ -105,9 +105,31 @@ Binaries land in `build/scheds/c/`. To rebuild after editing a `.bpf.c`, just re
 #                      | Ubuntu: linux-tools-common linux-tools-$(uname -r))
 git clone https://github.com/sched-ext/scx.git ~/src/scx     # headers only
 cd scx-talk-demos
-make -f Makefile.manual SCX=~/src/scx
+make -f Makefile.manual SCX=$HOME/src/scx info    # check what resolved
+make -f Makefile.manual SCX=$HOME/src/scx
 sudo ./scx_minfifo
 ```
+
+**Always run `info` first.** It prints the four things that decide whether the build works:
+
+```
+SCX_VMLINUX = .../scx/scheds/vmlinux/arch/x86/vmlinux.h   # scx's, not the kernel's
+MULTIARCH   = x86_64-linux-gnu                            # Ubuntu/Debian only
+LIBBPF      = <system -lbpf>                              # or a path to libbpf.a
+```
+
+On **Arch / openSUSE** the defaults are correct and `make -f Makefile.manual SCX=...` is all you need.
+
+On **Ubuntu 24.04** the system libbpf (1.3) is too old for struct_ops skeletons, so build one:
+
+```sh
+git clone https://github.com/libbpf/libbpf ~/src/libbpf
+cd ~/src/libbpf/src && make BUILD_STATIC_ONLY=y DESTDIR=$PWD/root install
+cd -
+make -f Makefile.manual SCX=$HOME/src/scx LIBBPF=$HOME/src/libbpf/src/root
+```
+
+Use `$HOME/...` or a `./relative` path — the shell does **not** expand `~..`, and a wrong `LIBBPF` now aborts the build rather than silently using the system one. (Ubuntu's easier path remains meson, which vendors its own libbpf and bpftool.)
 
 What each step is, if you want to run them by hand:
 
@@ -142,7 +164,19 @@ make -f Makefile.manual SCX=~/src/scx      # right
 
 Nothing is compiled from the checkout — only `scheds/include/scx/*.h` is borrowed. The Makefile now checks for `$(SCX)/scheds/include/scx/common.bpf.h` up front and prints this hint instead of a clang error. If a future scx release relocates the headers, point at them directly: `make -f Makefile.manual SCX_INC=/path/to/include`.
 
-**`struct ... __sched_ext_ops` has no member named `rescue_bandwidth_ppt`** (or `rescue_quantum_us`, or any other field, inside `SCX_OPS_OPEN`) — **you compiled against a `vmlinux.h` generated from your running kernel instead of the one bundled in the scx repo.** The BPF side compiling cleanly while only the loader fails is the signature.
+**`struct bpf_map_skeleton has no member named 'link'` (Ubuntu 24.04)** — your `bpftool` is newer than your `libbpf-dev`. Noble ships libbpf 1.3; struct_ops skeletons need 1.4+, so bpftool emits `map->link` and the old headers reject it. Build a current libbpf and point the Makefile at it:
+
+```sh
+git clone https://github.com/libbpf/libbpf ~/src/libbpf
+cd ~/src/libbpf/src && make BUILD_STATIC_ONLY=y DESTDIR=$PWD/root install
+cd -   # back to scx-talk-demos
+make -f Makefile.manual clean
+make -f Makefile.manual SCX=../scx LIBBPF=~/src/libbpf/src/root
+```
+
+`make info` will confirm: `LIBBPF = .../libbpf.a` instead of `<system -lbpf>`. Static linking also means the binaries you demo carry no runtime library-path surprises. (Alternative: use the meson path on Ubuntu — scx's build can vendor its own libbpf and bpftool. The manual Makefile is the teaching artifact; meson is the path of least resistance on older distros.)
+
+**`struct ... __sched_ext_ops` has no member named `rescue_bandwidth_ppt` / `sub_attach` / `sub_detach` / `sub_cgroup_id`** (or any other field, inside `SCX_OPS_OPEN`) — **you compiled against a `vmlinux.h` generated from your running kernel instead of the one bundled in the scx repo.** The BPF side compiling cleanly while only the loader fails is the signature. The `sub_*` fields are sub-scheduler support (`CONFIG_EXT_SUB_SCHED`), absent from kernels built without it — another reason not to depend on the local BTF.
 
 Why it happens: `scx/compat.h` is written against recent kernel types. It references newer `sched_ext_ops` fields at *compile* time and zeroes them at *runtime* when the live kernel lacks them — that is the whole point of the compat layer. So the correct input is scx's own newer `vmlinux.h`; CO-RE relocations make the result load fine on your older kernel.
 
@@ -168,6 +202,18 @@ Pinning scx to an older revision also resolves it, and is the right move if you 
 cd ../scx && git log --oneline -S rescue_bandwidth_ppt -- scheds/include/scx/compat.h | tail -1
 git checkout <that_commit>^
 ```
+
+**`fatal error: 'bits/wordsize.h' file not found` (Debian/Ubuntu only)** — scx's `compat.bpf.h` includes `<errno.h>`, which reaches `bits/wordsize.h`. On Debian/Ubuntu that header lives under the multiarch directory `/usr/include/x86_64-linux-gnu/bits/`, and `clang -target bpf` does not add it automatically (changing the target triple drops the host's default include paths). Arch and openSUSE keep it in `/usr/include/bits/`, so they never hit this.
+
+The Makefile now detects the multiarch dir via `cc -print-multiarch` and appends it. Confirm with:
+
+```sh
+make -f Makefile.manual SCX=../scx info
+#   MULTIARCH   = x86_64-linux-gnu        <- Ubuntu/Debian, dir will be added
+#   MULTIARCH   = <none - non-multiarch>  <- Arch/openSUSE, nothing needed
+```
+
+Manual equivalent if you are running clang by hand: add `-I/usr/include/$(cc -print-multiarch)`.
 
 **`redefinition of enumerator 'NR_STATS'` (or any identifier, pointing at vmlinux.h)** — your name collides with a kernel identifier. vmlinux.h is the *entire kernel's* type universe dumped into one header, and BPF C shares one namespace with it, so short generic names (`NR_STATS`, `MAX_ENTRIES`, `STAT_READ`...) are land mines. Prefix your enums and structs — this repo uses `PREFCORE_NR_STATS` for exactly this reason. Worth ten seconds in the talk: it surprises everyone once.
 

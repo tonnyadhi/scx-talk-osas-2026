@@ -47,9 +47,20 @@ SCX_INC ?= $(SCX)/scheds/include
 #
 # Override explicitly if auto-detection misses:  make ... SCX_VMLINUX=/path/vmlinux.h
 SCX_VMLINUX ?= $(firstword $(wildcard \
+                 $(SCX)/scheds/vmlinux/arch/$(ARCH)/vmlinux.h \
                  $(SCX_INC)/arch/$(ARCH)/vmlinux.h \
                  $(SCX_INC)/vmlinux/vmlinux.h \
-                 $(SCX_INC)/vmlinux.h))
+                 $(SCX_INC)/vmlinux.h \
+                 $(SCX_INC)/bpf-compat/vmlinux.h \
+                 $(SCX)/scheds/vmlinux.h \
+                 $(SCX)/vmlinux.h))
+
+# Last resort: search the checkout (layouts move between scx releases).
+ifeq ($(SCX_VMLINUX),)
+  SCX_VMLINUX := $(firstword \
+                   $(shell find $(SCX) -name vmlinux.h -path '*$(ARCH)*' 2>/dev/null) \
+                   $(shell find $(SCX) -name vmlinux.h 2>/dev/null))
+endif
 
 ifneq ($(SCX_VMLINUX),)
   # scx ships one: put its directory first on the include path.
@@ -61,15 +72,57 @@ else
   VMLINUX_DEP := vmlinux.h
 endif
 
+# --- Debian/Ubuntu multiarch glibc headers --------------------------------
+# scx's compat.bpf.h includes <errno.h>, which reaches bits/wordsize.h.
+# On Debian/Ubuntu that header lives in /usr/include/x86_64-linux-gnu/bits/,
+# and "clang -target bpf" does NOT add the multiarch dir automatically:
+#   fatal error: 'bits/wordsize.h' file not found
+# Arch/openSUSE keep it in /usr/include/bits/, so this resolves to empty
+# there and nothing changes.
+MULTIARCH := $(shell $(CC) -print-multiarch 2>/dev/null)
+ifeq ($(MULTIARCH),)
+  MULTIARCH := $(notdir $(firstword $(wildcard /usr/include/*-linux-gnu)))
+endif
+ifneq ($(MULTIARCH),)
+  GLIBC_INC := -I/usr/include/$(MULTIARCH)
+endif
+
 # Extra dirs some scx versions want; clang ignores the ones that don't exist.
 # -Wno-missing-declarations silences the harmless "declaration does not
 # declare anything" noise from bpftool's vmlinux.h dump (anonymous types).
 BPF_CFLAGS  := -O2 -g -target bpf -D__TARGET_ARCH_$(ARCH) -mcpu=v3 \
                -Wno-missing-declarations -Wno-compare-distinct-pointer-types \
                $(VMLINUX_INC) -I. -I$(SCX_INC) -I$(SCX_INC)/bpf-compat \
-               -I$(SCX_INC)/arch/$(ARCH)
+               -I$(SCX_INC)/arch/$(ARCH) $(GLIBC_INC)
 USER_CFLAGS := -O2 -g -I. -I$(SCX_INC)
 LDLIBS      := -lbpf -lelf -lz
+
+# --- optional: locally built libbpf ---------------------------------------
+# Needed when the distro's libbpf is older than the bpftool that generated
+# the skeleton (Ubuntu 24.04 ships libbpf 1.3; struct_ops skeletons need
+# 1.4+), which shows up as:
+#   skel.h: error: 'struct bpf_map_skeleton' has no member named 'link'
+#
+#   git clone https://github.com/libbpf/libbpf ~/src/libbpf
+#   cd ~/src/libbpf/src && make BUILD_STATIC_ONLY=y DESTDIR=$PWD/root install
+#   make -f Makefile.manual SCX=../scx LIBBPF=$HOME/src/libbpf/src/root
+# Use $HOME or a ./relative path - "~.." is NOT expanded by the shell.
+ifneq ($(LIBBPF),)
+  LIBBPF_A    := $(firstword $(wildcard $(LIBBPF)/usr/lib64/libbpf.a \
+                                        $(LIBBPF)/usr/lib/libbpf.a \
+                                        $(LIBBPF)/lib64/libbpf.a \
+                                        $(LIBBPF)/libbpf.a))
+  # Fail loudly rather than silently falling back to the system libbpf.
+  # (A common cause: "~../path" - bash does NOT expand a tilde before "..",
+  #  so the value stays literal and the directory does not exist.)
+  ifeq ($(LIBBPF_A),)
+    $(error LIBBPF=$(LIBBPF) but no libbpf.a under it. Build it first: \
+      cd libbpf/src && make BUILD_STATIC_ONLY=y DESTDIR=$$PWD/root install \
+      - then pass an absolute or ./relative path (not "~.."))
+  endif
+  USER_CFLAGS += -I$(LIBBPF)/usr/include -I$(LIBBPF)/include
+  LDLIBS      := $(LIBBPF_A) -lelf -lz
+endif
 
 .PHONY: all clean check-scx info
 all: $(SCHEDS)
@@ -80,6 +133,8 @@ info:
 	@echo "SCX_INC     = $(SCX_INC)"
 	@echo "ARCH        = $(ARCH)"
 	@echo "SCX_VMLINUX = $(if $(SCX_VMLINUX),$(SCX_VMLINUX),<none found - generating from running kernel>)"
+	@echo "MULTIARCH   = $(if $(MULTIARCH),$(MULTIARCH),<none - non-multiarch distro>)"
+	@echo "LIBBPF      = $(if $(LIBBPF),$(LIBBPF_A),<system -lbpf>)"
 	@echo "CC          = $(CC)"
 
 # Fail early and loudly if SCX does not point at an scx *checkout*.
@@ -94,9 +149,24 @@ check-scx:
 	  echo "These headers are all we borrow from it - nothing is built there."; \
 	  echo ""; \
 	  echo "    git clone https://github.com/sched-ext/scx.git ~/src/scx"; \
-	  echo "    make -f Makefile.manual SCX=~/src/scx"; \
+	  echo "    make -f Makefile.manual SCX=\$$HOME/src/scx"; \
 	  echo ""; \
 	  exit 1; }
+	@# A leftover vmlinux.h can only confuse things once scx ships one.
+	@if [ -n "$(SCX_VMLINUX)" ] && [ -f vmlinux.h ]; then \
+	   echo "note: using $(SCX_VMLINUX); local vmlinux.h is ignored (rm it to be sure)"; \
+	 fi
+	@# Proactive warning for the Ubuntu 24.04 case.
+	@v=$$(pkg-config --modversion libbpf 2>/dev/null); \
+	 if [ -n "$$v" ] && [ -z "$(LIBBPF)" ] && \
+	    [ "$$(printf '%s\n1.4.0\n' "$$v" | sort -V | head -1)" = "$$v" ] && \
+	    [ "$$v" != "1.4.0" ]; then \
+	   echo ""; \
+	   echo "WARNING: system libbpf is $$v (< 1.4). struct_ops skeletons need 1.4+."; \
+	   echo "  If the loader fails with \"struct bpf_map_skeleton has no member\""; \
+	   echo "  named 'link'\", build libbpf and pass LIBBPF=<dir> - see README."; \
+	   echo ""; \
+	 fi
 
 # 1. Kernel types as a C header. Only built when scx ships no vmlinux.h of
 #    its own (see SCX_VMLINUX above). CO-RE relocations make the resulting
